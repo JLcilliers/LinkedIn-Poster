@@ -931,95 +931,114 @@ function handleCheckSource(req, res, path) {
     return res.status(404).json({ error: 'Source not found' });
   }
 
-  // Fetch the RSS feed
-  const feedUrl = new URL(source.feedUrl);
-  const protocol = feedUrl.protocol === 'https:' ? https : require('http');
-
-  const feedReq = protocol.get(source.feedUrl, {
-    headers: { 'User-Agent': 'LinkedIn-Blog-Reposter/1.0' }
-  }, (feedRes) => {
-    let data = '';
-    feedRes.on('data', chunk => data += chunk);
-    feedRes.on('end', () => {
-      try {
-        // Simple RSS parsing (extract items)
-        const itemMatches = data.match(/<item[^>]*>[\s\S]*?<\/item>/gi) || [];
-        let found = 0;
-        let filtered = 0;
-
-        itemMatches.slice(0, 10).forEach((item, index) => {
-          const titleMatch = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
-          const linkMatch = item.match(/<link[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
-          const descMatch = item.match(/<description[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
-
-          const title = titleMatch ? titleMatch[1].trim().replace(/<[^>]+>/g, '') : 'Untitled';
-          const link = linkMatch ? linkMatch[1].trim() : '';
-          const description = descMatch ? descMatch[1].trim().replace(/<[^>]+>/g, '').substring(0, 300) : '';
-
-          // Check if already exists
-          if (articles.find(a => a.url === link)) return;
-
-          const textToCheck = (title + ' ' + description).toLowerCase();
-
-          // Apply keyword filtering
-          let shouldInclude = true;
-
-          // Check include keywords
-          if (source.includeKeywords && source.includeKeywords.length > 0) {
-            shouldInclude = source.includeKeywords.some(kw => textToCheck.includes(kw));
-          }
-
-          // Check exclude keywords
-          if (shouldInclude && source.excludeKeywords && source.excludeKeywords.length > 0) {
-            shouldInclude = !source.excludeKeywords.some(kw => textToCheck.includes(kw));
-          }
-
-          if (shouldInclude) {
-            articles.push({
-              id: Date.now().toString() + index,
-              sourceId: source.id,
-              sourceName: source.name,
-              title: title,
-              url: link,
-              description: description,
-              publishedAt: new Date().toISOString(),
-              status: 'new',
-              matchedKeywords: source.includeKeywords.filter(kw => textToCheck.includes(kw))
-            });
-            found++;
-            activityLog.push({
-              id: Date.now().toString() + index,
-              type: 'ARTICLE_FOUND',
-              message: `Found article: ${title.substring(0, 50)}...`,
-              details: `Matched keywords: ${source.includeKeywords.filter(kw => textToCheck.includes(kw)).join(', ') || 'All topics'}`,
-              timestamp: new Date().toISOString()
-            });
-          } else {
-            filtered++;
-          }
-        });
-
-        source.lastChecked = new Date().toISOString();
-        source.articlesFound = (source.articlesFound || 0) + found;
-        source.articlesFiltered = (source.articlesFiltered || 0) + filtered;
-
-        activityLog.push({
-          id: Date.now().toString(),
-          type: 'SOURCE_CHECKED',
-          message: `Checked ${source.name}: ${found} articles matched, ${filtered} filtered out`,
-          timestamp: new Date().toISOString()
-        });
-
-        res.status(200).json({ success: true, articlesFound: found, articlesFiltered: filtered });
-      } catch (e) {
-        res.status(500).json({ error: 'Failed to parse RSS: ' + e.message });
+  // Helper function to fetch with redirect support
+  function fetchWithRedirects(url, maxRedirects = 5) {
+    return new Promise((resolve, reject) => {
+      if (maxRedirects <= 0) {
+        return reject(new Error('Too many redirects'));
       }
-    });
-  });
 
-  feedReq.on('error', (e) => {
-    res.status(500).json({ error: 'Failed to fetch RSS: ' + e.message });
-  });
+      const feedUrl = new URL(url);
+      const protocol = feedUrl.protocol === 'https:' ? https : require('http');
+
+      const feedReq = protocol.get(url, {
+        headers: { 'User-Agent': 'LinkedIn-Blog-Reposter/1.0' }
+      }, (feedRes) => {
+        // Handle redirects
+        if (feedRes.statusCode >= 300 && feedRes.statusCode < 400 && feedRes.headers.location) {
+          let redirectUrl = feedRes.headers.location;
+          // Handle relative redirects
+          if (!redirectUrl.startsWith('http')) {
+            redirectUrl = new URL(redirectUrl, url).href;
+          }
+          return fetchWithRedirects(redirectUrl, maxRedirects - 1).then(resolve).catch(reject);
+        }
+
+        let data = '';
+        feedRes.on('data', chunk => data += chunk);
+        feedRes.on('end', () => resolve(data));
+      });
+
+      feedReq.on('error', reject);
+    });
+  }
+
+  // Fetch and process the RSS feed
+  fetchWithRedirects(source.feedUrl)
+    .then(data => {
+      // Simple RSS parsing (extract items)
+      const itemMatches = data.match(/<item[^>]*>[\s\S]*?<\/item>/gi) || [];
+      let found = 0;
+      let filtered = 0;
+
+      itemMatches.slice(0, 10).forEach((item, index) => {
+        const titleMatch = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+        const linkMatch = item.match(/<link[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
+        const descMatch = item.match(/<description[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
+
+        const title = titleMatch ? titleMatch[1].trim().replace(/<[^>]+>/g, '') : 'Untitled';
+        const link = linkMatch ? linkMatch[1].trim() : '';
+        const description = descMatch ? descMatch[1].trim().replace(/<[^>]+>/g, '').substring(0, 300) : '';
+
+        // Check if already exists
+        if (articles.find(a => a.url === link)) return;
+
+        const textToCheck = (title + ' ' + description).toLowerCase();
+
+        // Apply keyword filtering
+        let shouldInclude = true;
+
+        // Check include keywords
+        if (source.includeKeywords && source.includeKeywords.length > 0) {
+          shouldInclude = source.includeKeywords.some(kw => textToCheck.includes(kw));
+        }
+
+        // Check exclude keywords
+        if (shouldInclude && source.excludeKeywords && source.excludeKeywords.length > 0) {
+          shouldInclude = !source.excludeKeywords.some(kw => textToCheck.includes(kw));
+        }
+
+        if (shouldInclude) {
+          articles.push({
+            id: Date.now().toString() + index,
+            sourceId: source.id,
+            sourceName: source.name,
+            title: title,
+            url: link,
+            description: description,
+            publishedAt: new Date().toISOString(),
+            status: 'new',
+            matchedKeywords: source.includeKeywords.filter(kw => textToCheck.includes(kw))
+          });
+          found++;
+          activityLog.push({
+            id: Date.now().toString() + index,
+            type: 'ARTICLE_FOUND',
+            message: `Found article: ${title.substring(0, 50)}...`,
+            details: `Matched keywords: ${source.includeKeywords.filter(kw => textToCheck.includes(kw)).join(', ') || 'All topics'}`,
+            timestamp: new Date().toISOString()
+          });
+        } else {
+          filtered++;
+        }
+      });
+
+      source.lastChecked = new Date().toISOString();
+      source.articlesFound = (source.articlesFound || 0) + found;
+      source.articlesFiltered = (source.articlesFiltered || 0) + filtered;
+
+      activityLog.push({
+        id: Date.now().toString(),
+        type: 'SOURCE_CHECKED',
+        message: `Checked ${source.name}: ${found} articles matched, ${filtered} filtered out`,
+        timestamp: new Date().toISOString()
+      });
+
+      res.status(200).json({ success: true, articlesFound: found, articlesFiltered: filtered });
+    })
+    .catch(e => {
+      res.status(500).json({ error: 'Failed to fetch RSS: ' + e.message });
+    });
 }
 
 function handleCheckAllSources(req, res) {
