@@ -1,12 +1,4 @@
 import express from 'express';
-import { config } from '../src/config/env';
-import { connectDatabase } from '../src/config/database';
-import { logger } from '../src/utils/logger';
-
-// Routes
-import adminRoutes from '../src/routes/admin';
-import authRoutes from '../src/routes/auth';
-import healthRoutes from '../src/routes/health';
 
 const app = express();
 
@@ -14,31 +6,14 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request logging
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    logger.debug(`${req.method} ${req.path}`, {
-      status: res.statusCode,
-      duration: `${duration}ms`,
-    });
-  });
-  next();
-});
-
-// Routes
-app.use('/admin', adminRoutes);
-app.use('/auth', authRoutes);
-app.use('/health', healthRoutes);
-
-// Root endpoint
+// Root endpoint - simple health check
 app.get('/', (req, res) => {
   res.json({
     name: 'LinkedIn Blog Reposter',
     version: '1.0.0',
     status: 'running',
-    environment: 'vercel',
+    environment: process.env.NODE_ENV || 'development',
+    message: 'API is working on Vercel!',
     endpoints: {
       health: '/health',
       admin: '/admin',
@@ -47,24 +22,26 @@ app.get('/', (req, res) => {
   });
 });
 
-// Error handling
-app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  logger.error('Unhandled error', { error: err.message, stack: err.stack });
-  res.status(500).json({ error: 'Internal server error' });
+// Health endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// Initialize database connection (lazy)
-let dbInitialized = false;
-app.use(async (req, res, next) => {
-  if (!dbInitialized) {
-    try {
-      await connectDatabase();
-      dbInitialized = true;
-    } catch (error) {
-      logger.error('Database connection failed', { error });
-    }
-  }
-  next();
+// Catch-all for other routes
+app.all('*', (req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `Route ${req.method} ${req.path} not found`,
+  });
+});
+
+// Error handling
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Error:', err.message);
+  res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
 export default app;
