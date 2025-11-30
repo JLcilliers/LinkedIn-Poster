@@ -827,6 +827,7 @@ function handleRequest(req, res) {
   if (path.startsWith('/api/sources/') && method === 'DELETE') return handleDeleteSource(req, res, path);
   if (path.startsWith('/api/sources/') && path.endsWith('/check')) return handleCheckSource(req, res, path);
   if (path === '/api/sources/check-all') return handleCheckAllSources(req, res);
+  if (path === '/api/articles' && method === 'GET') return handleGetArticles(req, res);
   if (path === '/api/generate' && method === 'POST') return handleGenerateFromUrl(req, res);
   if (path.startsWith('/api/articles/') && path.endsWith('/generate')) return handleGenerateFromArticle(req, res, path);
   if (path.startsWith('/api/posts/') && path.endsWith('/approve')) return handleApprovePost(req, res, path);
@@ -910,6 +911,10 @@ function handleAddSource(req, res) {
 
 function handleGetSources(req, res) {
   res.status(200).json(blogSources);
+}
+
+function handleGetArticles(req, res) {
+  res.status(200).json(articles);
 }
 
 function handleDeleteSource(req, res, path) {
