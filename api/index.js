@@ -1,4 +1,4 @@
-import express from 'express';
+const express = require('express');
 
 const app = express();
 
@@ -39,9 +39,9 @@ app.all('*', (req, res) => {
 });
 
 // Error handling
-app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((err, req, res, next) => {
   console.error('Error:', err.message);
   res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
-export default app;
+module.exports = app;
