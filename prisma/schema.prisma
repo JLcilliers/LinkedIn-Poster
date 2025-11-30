@@ -1,0 +1,144 @@
+// LinkedIn Blog Reposter - Database Schema
+// Using SQLite for simplicity (easily swappable to PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Blog/website sources to monitor for new content
+model BlogSource {
+  id                    String    @id @default(uuid())
+  name                  String
+  feedUrl               String    // RSS feed URL or API endpoint
+  type                  SourceType @default(RSS)
+  active                Boolean   @default(true)
+  lastCheckedAt         DateTime?
+  lastSeenExternalId    String?   // Last seen RSS GUID or external ID
+  lastSeenPublishedAt   DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  articles              Article[]
+
+  @@index([active])
+}
+
+enum SourceType {
+  RSS
+  SITEMAP
+  CUSTOM_SCRAPER
+}
+
+// Articles fetched from blog sources
+model Article {
+  id                String        @id @default(uuid())
+  sourceId          String
+  source            BlogSource    @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  externalId        String        // RSS GUID or unique identifier
+  url               String
+  title             String
+  rawSummary        String?       // Short summary from feed
+  rawContent        String?       // Full article content (extracted)
+  publishedAt       DateTime?
+  status            ArticleStatus @default(NEW)
+  errorMessage      String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  linkedInPosts     LinkedInPost[]
+
+  @@unique([sourceId, externalId])
+  @@index([status])
+  @@index([publishedAt])
+}
+
+enum ArticleStatus {
+  NEW                     // Fetched but not processed yet
+  FETCHING_CONTENT        // Currently fetching full content
+  CONTENT_FETCHED         // Full content available
+  REJECTED_NOT_RELEVANT   // Does not match criteria
+  READY_FOR_POST          // Relevant and awaiting post generation
+  POST_GENERATED          // LinkedIn post has been generated
+  POSTED_TO_LINKEDIN      // Successfully published
+  FAILED                  // Failed (check errorMessage)
+}
+
+// Generated LinkedIn posts
+model LinkedInPost {
+  id              String          @id @default(uuid())
+  articleId       String
+  article         Article         @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  contentDraft    String          // AI-generated draft
+  contentFinal    String?         // Final posted content (may differ if edited)
+  mode            PostMode        @default(AUTO)
+  linkedInPostUrn String?         // LinkedIn's URN for the post
+  linkedInPostUrl String?         // URL to the published post
+  status          LinkedInPostStatus @default(DRAFT)
+  errorMessage    String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum PostMode {
+  AUTO              // Automatically posted
+  MANUAL_REVIEWED   // Manually reviewed before posting
+}
+
+enum LinkedInPostStatus {
+  DRAFT             // Generated but not yet posted
+  PENDING_REVIEW    // Awaiting manual approval
+  APPROVED          // Approved, ready to post
+  PUBLISHING        // Currently being posted
+  PUBLISHED         // Successfully published
+  FAILED            // Failed to post (check errorMessage)
+}
+
+// Criteria configuration for filtering relevant articles
+model CriteriaConfig {
+  id                        String   @id @default(uuid())
+  name                      String   @default("default")
+  includeKeywords           String   // JSON array of keywords
+  excludeKeywords           String   // JSON array of keywords
+  targetAudienceDescription String   // Used in AI prompt
+  defaultHashtags           String   // JSON array of hashtags
+  maxPostsPerDay            Int      @default(3)
+  active                    Boolean  @default(true)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  @@index([active])
+}
+
+// LinkedIn OAuth tokens (stored securely)
+model LinkedInToken {
+  id            String   @id @default(uuid())
+  memberUrn     String   @unique // LinkedIn member URN (urn:li:person:xxx)
+  accessToken   String   // Encrypted access token
+  refreshToken  String?  // Encrypted refresh token (if available)
+  expiresAt     DateTime
+  scopes        String   // JSON array of scopes
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// Activity log for auditing
+model ActivityLog {
+  id          String   @id @default(uuid())
+  type        String   // ARTICLE_DISCOVERED, POST_GENERATED, POSTED, etc.
+  entityType  String?  // Article, LinkedInPost, etc.
+  entityId    String?
+  message     String
+  metadata    String?  // JSON for additional data
+  createdAt   DateTime @default(now())
+
+  @@index([type])
+  @@index([createdAt])
+}

@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.db-journal
+prisma/dev.db
+prisma/dev.db-journal
+
+# Generated files
+/src/generated/
+
+# Logs
+logs/
+*.log
+
+# Screenshots and browser data
+screenshots/
+playwright-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Playwright MCP
+.playwright-mcp/
+
+# Logo files (generated)
+app-logo.png
+create-logo.ps1
