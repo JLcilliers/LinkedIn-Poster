@@ -1093,18 +1093,100 @@ function handleGenerateFromArticle(req, res, path) {
     return res.status(404).json({ error: 'Article not found' });
   }
 
-  const post = {
-    id: Date.now().toString(),
-    articleId: article.id,
-    articleTitle: article.title,
-    content: `🚀 Check out this article: ${article.title}\n\nKey insights from the post...\n\n🔗 ${article.url}\n\n#Tech #Innovation`,
-    status: 'pending',
-    createdAt: new Date().toISOString()
-  };
-  posts.push(post);
-  article.status = 'processed';
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) {
+    // Fallback if no OpenAI key
+    const post = {
+      id: Date.now().toString(),
+      articleId: article.id,
+      articleTitle: article.title,
+      content: `[OpenAI API key not configured. Please add OPENAI_API_KEY to generate AI content.]`,
+      status: 'pending',
+      createdAt: new Date().toISOString()
+    };
+    posts.push(post);
+    return res.status(201).json(post);
+  }
 
-  res.status(201).json(post);
+  // Use OpenAI to generate original LinkedIn post
+  const prompt = `You are a LinkedIn thought leader. Based on the following article topic and summary, write an ORIGINAL LinkedIn post that shares YOUR OWN insights and perspective on this topic.
+
+IMPORTANT RULES:
+- Do NOT mention or reference the source article in any way
+- Do NOT include any links or URLs
+- Write as if this is YOUR original thought/insight
+- Make it personal and engaging
+- Use a conversational, professional tone
+- Include 2-3 relevant hashtags at the end
+- Keep it between 150-250 words
+- Start with a hook that grabs attention
+
+Article Topic: ${article.title}
+Article Summary: ${article.description}
+
+Write the LinkedIn post now:`;
+
+  const requestBody = JSON.stringify({
+    model: process.env.OPENAI_MODEL || 'gpt-4o',
+    messages: [{ role: 'user', content: prompt }],
+    max_tokens: 500,
+    temperature: 0.8
+  });
+
+  const options = {
+    hostname: 'api.openai.com',
+    path: '/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${openaiKey}`,
+      'Content-Length': Buffer.byteLength(requestBody)
+    }
+  };
+
+  const openaiReq = https.request(options, (openaiRes) => {
+    let data = '';
+    openaiRes.on('data', chunk => data += chunk);
+    openaiRes.on('end', () => {
+      try {
+        const result = JSON.parse(data);
+        if (result.error) {
+          return res.status(500).json({ error: 'OpenAI error: ' + result.error.message });
+        }
+
+        const generatedContent = result.choices[0].message.content.trim();
+
+        const post = {
+          id: Date.now().toString(),
+          articleId: article.id,
+          articleTitle: article.title,
+          content: generatedContent,
+          status: 'pending',
+          createdAt: new Date().toISOString()
+        };
+        posts.push(post);
+        article.status = 'processed';
+
+        activityLog.push({
+          id: Date.now().toString(),
+          type: 'POST_GENERATED',
+          message: `Generated post from: ${article.title.substring(0, 40)}...`,
+          timestamp: new Date().toISOString()
+        });
+
+        res.status(201).json(post);
+      } catch (e) {
+        res.status(500).json({ error: 'Failed to parse OpenAI response: ' + e.message });
+      }
+    });
+  });
+
+  openaiReq.on('error', (e) => {
+    res.status(500).json({ error: 'OpenAI request failed: ' + e.message });
+  });
+
+  openaiReq.write(requestBody);
+  openaiReq.end();
 }
 
 function handleApprovePost(req, res, path) {
