@@ -5,6 +5,7 @@ const querystring = require('querystring');
 let blogSources = [];
 let articles = [];
 let posts = [];
+let activityLog = [];
 
 // Shared styles for all pages
 const getStyles = () => `
@@ -324,6 +325,31 @@ function getDashboardHTML(config) {
       </div>
     </div>
     ` : ''}
+
+    <div class="card">
+      <h2>📋 Recent Activity</h2>
+      <p class="subtitle" style="margin-bottom:16px;">See what's happening with your sources and articles</p>
+      ${activityLog.length === 0 ? `
+        <div style="text-align:center;padding:32px;color:#666;">
+          <p>No activity yet. Add sources and check them to see activity here.</p>
+        </div>
+      ` : `
+        <div style="max-height:300px;overflow-y:auto;">
+          ${activityLog.slice(-10).reverse().map(log => `
+            <div style="padding:12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:flex-start;">
+              <div style="font-size:1.2rem;">
+                ${log.type === 'SOURCE_ADDED' ? '➕' : log.type === 'SOURCE_CHECKED' ? '🔄' : log.type === 'ARTICLE_FOUND' ? '📰' : log.type === 'POST_GENERATED' ? '✍️' : log.type === 'POST_PUBLISHED' ? '✅' : '📌'}
+              </div>
+              <div style="flex:1;">
+                <div style="font-weight:500;">${log.message}</div>
+                ${log.details ? `<div style="font-size:0.85rem;color:#666;margin-top:4px;">${log.details}</div>` : ''}
+                <div style="font-size:0.75rem;color:#999;margin-top:4px;">${new Date(log.timestamp).toLocaleString()}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `}
+    </div>
   </div>
 
   <div class="footer">LinkedIn Blog Reposter v1.0.0 | Powered by Vercel</div>
@@ -378,8 +404,8 @@ function getSourcesHTML() {
           <thead>
             <tr>
               <th>Name</th>
-              <th>Feed URL</th>
-              <th>Status</th>
+              <th>Keywords</th>
+              <th>Stats</th>
               <th>Last Checked</th>
               <th>Actions</th>
             </tr>
@@ -387,10 +413,22 @@ function getSourcesHTML() {
           <tbody>
             ${blogSources.map(source => `
               <tr>
-                <td><strong>${source.name}</strong></td>
-                <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${source.feedUrl}</td>
-                <td><span class="badge ${source.active ? 'badge-success' : 'badge-secondary'}">${source.active ? 'Active' : 'Paused'}</span></td>
-                <td>${source.lastChecked || 'Never'}</td>
+                <td>
+                  <strong>${source.name}</strong>
+                  <div style="font-size:0.8rem;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${source.feedUrl}</div>
+                </td>
+                <td>
+                  ${source.includeKeywords && source.includeKeywords.length > 0 ?
+                    `<span class="badge badge-info" style="margin-right:4px;">Include: ${source.includeKeywords.join(', ')}</span>` :
+                    '<span class="badge badge-secondary">All topics</span>'}
+                  ${source.excludeKeywords && source.excludeKeywords.length > 0 ?
+                    `<br><span class="badge badge-warning" style="margin-top:4px;">Exclude: ${source.excludeKeywords.join(', ')}</span>` : ''}
+                </td>
+                <td>
+                  <div style="font-size:0.85rem;"><strong>${source.articlesFound || 0}</strong> found</div>
+                  <div style="font-size:0.85rem;color:#666;">${source.articlesFiltered || 0} filtered out</div>
+                </td>
+                <td>${source.lastChecked ? new Date(source.lastChecked).toLocaleString() : 'Never'}</td>
                 <td class="actions">
                   <button class="btn btn-sm btn-secondary" onclick="checkSource('${source.id}')">Check Now</button>
                   <button class="btn btn-sm btn-danger" onclick="deleteSource('${source.id}')">Delete</button>
@@ -431,6 +469,16 @@ function getSourcesHTML() {
           <label for="feedUrl">RSS Feed URL</label>
           <input type="url" id="feedUrl" name="feedUrl" class="form-control" placeholder="https://example.com/feed.xml" required>
         </div>
+        <div class="form-group">
+          <label for="includeKeywords">Include Keywords (comma-separated)</label>
+          <input type="text" id="includeKeywords" name="includeKeywords" class="form-control" placeholder="AI, machine learning, automation">
+          <small style="color:#666;margin-top:4px;display:block;">Only process articles containing these keywords. Leave empty to include all.</small>
+        </div>
+        <div class="form-group">
+          <label for="excludeKeywords">Exclude Keywords (comma-separated)</label>
+          <input type="text" id="excludeKeywords" name="excludeKeywords" class="form-control" placeholder="sponsored, advertisement">
+          <small style="color:#666;margin-top:4px;display:block;">Skip articles containing these keywords.</small>
+        </div>
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
           <button type="button" class="btn btn-secondary" onclick="hideAddModal()">Cancel</button>
           <button type="submit" class="btn btn-primary">Add Source</button>
@@ -463,7 +511,12 @@ function getSourcesHTML() {
       fetch('/api/sources', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: data.get('name'), feedUrl: data.get('feedUrl') })
+        body: JSON.stringify({
+          name: data.get('name'),
+          feedUrl: data.get('feedUrl'),
+          includeKeywords: data.get('includeKeywords'),
+          excludeKeywords: data.get('excludeKeywords')
+        })
       }).then(() => location.reload());
     };
     document.getElementById('addModal').onclick = function(e) {
@@ -827,16 +880,27 @@ function handleAddSource(req, res) {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     try {
-      const { name, feedUrl } = JSON.parse(body);
+      const { name, feedUrl, includeKeywords, excludeKeywords } = JSON.parse(body);
       const source = {
         id: Date.now().toString(),
         name,
         feedUrl,
+        includeKeywords: includeKeywords ? includeKeywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k) : [],
+        excludeKeywords: excludeKeywords ? excludeKeywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k) : [],
         active: true,
         lastChecked: null,
+        articlesFound: 0,
+        articlesFiltered: 0,
         createdAt: new Date().toISOString()
       };
       blogSources.push(source);
+      activityLog.push({
+        id: Date.now().toString(),
+        type: 'SOURCE_ADDED',
+        message: `Added source: ${name}`,
+        details: `Keywords: ${source.includeKeywords.length > 0 ? source.includeKeywords.join(', ') : 'All topics'}`,
+        timestamp: new Date().toISOString()
+      });
       res.status(201).json(source);
     } catch (e) {
       res.status(400).json({ error: 'Invalid JSON' });
@@ -857,21 +921,100 @@ function handleDeleteSource(req, res, path) {
 function handleCheckSource(req, res, path) {
   const id = path.split('/')[3];
   const source = blogSources.find(s => s.id === id);
-  if (source) {
-    source.lastChecked = new Date().toISOString();
-    // In production, this would fetch and parse the RSS feed
-    // For demo, add a sample article
-    articles.push({
-      id: Date.now().toString(),
-      sourceId: source.id,
-      sourceName: source.name,
-      title: 'Sample Article from ' + source.name,
-      url: source.feedUrl,
-      publishedAt: new Date().toISOString(),
-      status: 'new'
-    });
+
+  if (!source) {
+    return res.status(404).json({ error: 'Source not found' });
   }
-  res.status(200).json({ success: true, articlesFound: 1 });
+
+  // Fetch the RSS feed
+  const feedUrl = new URL(source.feedUrl);
+  const protocol = feedUrl.protocol === 'https:' ? https : require('http');
+
+  const feedReq = protocol.get(source.feedUrl, {
+    headers: { 'User-Agent': 'LinkedIn-Blog-Reposter/1.0' }
+  }, (feedRes) => {
+    let data = '';
+    feedRes.on('data', chunk => data += chunk);
+    feedRes.on('end', () => {
+      try {
+        // Simple RSS parsing (extract items)
+        const itemMatches = data.match(/<item[^>]*>[\s\S]*?<\/item>/gi) || [];
+        let found = 0;
+        let filtered = 0;
+
+        itemMatches.slice(0, 10).forEach((item, index) => {
+          const titleMatch = item.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+          const linkMatch = item.match(/<link[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
+          const descMatch = item.match(/<description[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
+
+          const title = titleMatch ? titleMatch[1].trim().replace(/<[^>]+>/g, '') : 'Untitled';
+          const link = linkMatch ? linkMatch[1].trim() : '';
+          const description = descMatch ? descMatch[1].trim().replace(/<[^>]+>/g, '').substring(0, 300) : '';
+
+          // Check if already exists
+          if (articles.find(a => a.url === link)) return;
+
+          const textToCheck = (title + ' ' + description).toLowerCase();
+
+          // Apply keyword filtering
+          let shouldInclude = true;
+
+          // Check include keywords
+          if (source.includeKeywords && source.includeKeywords.length > 0) {
+            shouldInclude = source.includeKeywords.some(kw => textToCheck.includes(kw));
+          }
+
+          // Check exclude keywords
+          if (shouldInclude && source.excludeKeywords && source.excludeKeywords.length > 0) {
+            shouldInclude = !source.excludeKeywords.some(kw => textToCheck.includes(kw));
+          }
+
+          if (shouldInclude) {
+            articles.push({
+              id: Date.now().toString() + index,
+              sourceId: source.id,
+              sourceName: source.name,
+              title: title,
+              url: link,
+              description: description,
+              publishedAt: new Date().toISOString(),
+              status: 'new',
+              matchedKeywords: source.includeKeywords.filter(kw => textToCheck.includes(kw))
+            });
+            found++;
+            activityLog.push({
+              id: Date.now().toString() + index,
+              type: 'ARTICLE_FOUND',
+              message: `Found article: ${title.substring(0, 50)}...`,
+              details: `Matched keywords: ${source.includeKeywords.filter(kw => textToCheck.includes(kw)).join(', ') || 'All topics'}`,
+              timestamp: new Date().toISOString()
+            });
+          } else {
+            filtered++;
+          }
+        });
+
+        source.lastChecked = new Date().toISOString();
+        source.articlesFound = (source.articlesFound || 0) + found;
+        source.articlesFiltered = (source.articlesFiltered || 0) + filtered;
+
+        activityLog.push({
+          id: Date.now().toString(),
+          type: 'SOURCE_CHECKED',
+          message: `Checked ${source.name}: ${found} articles matched, ${filtered} filtered out`,
+          timestamp: new Date().toISOString()
+        });
+
+        res.status(200).json({ success: true, articlesFound: found, articlesFiltered: filtered });
+      } catch (e) {
+        res.status(500).json({ error: 'Failed to parse RSS: ' + e.message });
+      }
+    });
+  });
+
+  feedReq.on('error', (e) => {
+    res.status(500).json({ error: 'Failed to fetch RSS: ' + e.message });
+  });
 }
 
 function handleCheckAllSources(req, res) {
