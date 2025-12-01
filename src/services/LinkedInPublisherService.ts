@@ -1,9 +1,9 @@
 import axios, { AxiosError } from 'axios';
-import { prisma } from '../config/database';
+import { getSupabaseClient, logActivity } from '../config/supabase';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { encrypt, decrypt } from '../utils/crypto';
-import type { PublishResult, LinkedInPostStatus } from '../types';
+import { BasePublisherService, PublishResult, PlatformCredentials } from './BasePublisherService';
 
 const LINKEDIN_API_BASE = 'https://api.linkedin.com/v2';
 const LINKEDIN_AUTH_URL = 'https://www.linkedin.com/oauth/v2';
@@ -14,7 +14,19 @@ interface LinkedInAPIError {
   serviceErrorCode?: number;
 }
 
-export class LinkedInPublisherService {
+interface LinkedInCredentials extends PlatformCredentials {
+  memberUrn: string;
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt: string;
+  scopes: string[];
+}
+
+export class LinkedInPublisherService extends BasePublisherService {
+  constructor() {
+    super('linkedin');
+  }
+
   /**
    * Get OAuth authorization URL
    */
@@ -71,9 +83,9 @@ export class LinkedInPublisherService {
   }
 
   /**
-   * Get the current user's member URN
+   * Get the current user's member URN from access token
    */
-  async getMemberUrn(accessToken: string): Promise<string> {
+  async fetchMemberUrn(accessToken: string): Promise<string> {
     try {
       const response = await axios.get(`${LINKEDIN_API_BASE}/userinfo`, {
         headers: {
@@ -81,7 +93,6 @@ export class LinkedInPublisherService {
         },
       });
 
-      // The sub claim contains the member ID
       const memberId = response.data.sub;
       return `urn:li:person:${memberId}`;
     } catch (error) {
@@ -94,35 +105,27 @@ export class LinkedInPublisherService {
   }
 
   /**
-   * Store token in database (encrypted)
+   * Store credentials after OAuth
    */
-  async storeToken(
-    memberUrn: string,
+  async storeCredentialsFromOAuth(
     accessToken: string,
     expiresIn: number,
     refreshToken?: string,
     scopes: string[] = []
   ): Promise<void> {
+    const memberUrn = await this.fetchMemberUrn(accessToken);
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
-    await prisma.linkedInToken.upsert({
-      where: { memberUrn },
-      create: {
-        memberUrn,
-        accessToken: encrypt(accessToken),
-        refreshToken: refreshToken ? encrypt(refreshToken) : null,
-        expiresAt,
-        scopes: JSON.stringify(scopes),
-      },
-      update: {
-        accessToken: encrypt(accessToken),
-        refreshToken: refreshToken ? encrypt(refreshToken) : null,
-        expiresAt,
-        scopes: JSON.stringify(scopes),
-      },
-    });
+    const credentials: LinkedInCredentials = {
+      memberUrn,
+      accessToken: encrypt(accessToken),
+      refreshToken: refreshToken ? encrypt(refreshToken) : undefined,
+      expiresAt: expiresAt.toISOString(),
+      scopes,
+    };
 
-    logger.info('Stored LinkedIn token', { memberUrn, expiresAt });
+    await this.saveCredentials(credentials);
+    logger.info('Stored LinkedIn credentials', { memberUrn, expiresAt });
   }
 
   /**
@@ -134,78 +137,47 @@ export class LinkedInPublisherService {
       return config.linkedin.accessToken;
     }
 
-    // Then check database
-    const token = await prisma.linkedInToken.findFirst({
-      where: {
-        expiresAt: { gt: new Date() },
-      },
-      orderBy: { expiresAt: 'desc' },
-    });
+    // Then check Supabase
+    const credentials = await this.getCredentials() as LinkedInCredentials | null;
 
-    if (!token) {
-      throw new Error('No valid LinkedIn access token available. Please authenticate.');
+    if (!credentials) {
+      throw new Error('No LinkedIn credentials available. Please authenticate.');
     }
 
-    return decrypt(token.accessToken);
+    // Check if expired
+    if (new Date(credentials.expiresAt) <= new Date()) {
+      throw new Error('LinkedIn access token expired. Please re-authenticate.');
+    }
+
+    return decrypt(credentials.accessToken);
   }
 
   /**
    * Get member URN
    */
-  async getMemberUrnFromConfig(): Promise<string> {
+  async getMemberUrn(): Promise<string> {
     // First check environment variable
     if (config.linkedin.memberUrn) {
       return config.linkedin.memberUrn;
     }
 
-    // Then check database
-    const token = await prisma.linkedInToken.findFirst({
-      where: {
-        expiresAt: { gt: new Date() },
-      },
-      orderBy: { expiresAt: 'desc' },
-    });
+    // Then check Supabase
+    const credentials = await this.getCredentials() as LinkedInCredentials | null;
 
-    if (!token) {
+    if (!credentials) {
       throw new Error('No LinkedIn member URN available. Please authenticate.');
     }
 
-    return token.memberUrn;
+    return credentials.memberUrn;
   }
 
   /**
-   * Check if we can post today (rate limit)
-   */
-  async canPostToday(): Promise<{ canPost: boolean; remaining: number; limit: number }> {
-    const criteria = await prisma.criteriaConfig.findFirst({
-      where: { active: true },
-    });
-
-    const maxPerDay = criteria?.maxPostsPerDay || 3;
-
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-
-    const postedToday = await prisma.linkedInPost.count({
-      where: {
-        status: 'PUBLISHED',
-        createdAt: { gte: todayStart },
-      },
-    });
-
-    return {
-      canPost: postedToday < maxPerDay,
-      remaining: Math.max(0, maxPerDay - postedToday),
-      limit: maxPerDay,
-    };
-  }
-
-  /**
-   * Publish a LinkedIn post
+   * Publish a post to LinkedIn
    */
   async publishPost(postId: string): Promise<PublishResult> {
     const result: PublishResult = {
       postId,
+      platform: 'linkedin',
       success: false,
     };
 
@@ -214,16 +186,12 @@ export class LinkedInPublisherService {
       const rateLimit = await this.canPostToday();
       if (!rateLimit.canPost) {
         result.error = `Daily post limit reached (${rateLimit.limit})`;
-        logger.warn('Cannot publish - daily limit reached', { postId, limit: rateLimit.limit });
+        logger.warn('Cannot publish to LinkedIn - daily limit reached', { postId, limit: rateLimit.limit });
         return result;
       }
 
-      // Get post from database
-      const post = await prisma.linkedInPost.findUnique({
-        where: { id: postId },
-        include: { article: true },
-      });
-
+      // Get post
+      const post = await this.getPost(postId);
       if (!post) {
         result.error = 'Post not found';
         return result;
@@ -234,51 +202,68 @@ export class LinkedInPublisherService {
         return result;
       }
 
-      // Get access token and member URN
-      const accessToken = await this.getAccessToken();
-      const memberUrn = await this.getMemberUrnFromConfig();
+      // Get content to post
+      const content = post.content_final || post.content_draft;
+      if (!content) {
+        result.error = 'No content to post';
+        return result;
+      }
 
-      // Mark as publishing
-      await prisma.linkedInPost.update({
-        where: { id: postId },
-        data: { status: 'PUBLISHING' },
-      });
+      // Get credentials
+      const accessToken = await this.getAccessToken();
+      const memberUrn = await this.getMemberUrn();
+
+      // Get media URLs if any
+      const mediaUrls = await this.getPostMediaUrls(post);
 
       // Create the post on LinkedIn
-      const linkedInResponse = await this.createLinkedInPost(
-        accessToken,
-        memberUrn,
-        post.contentDraft
-      );
+      let linkedInResponse: { id: string; activity?: string };
 
-      // Update post with LinkedIn info
-      await prisma.linkedInPost.update({
-        where: { id: postId },
-        data: {
-          status: 'PUBLISHED',
-          contentFinal: post.contentDraft,
-          linkedInPostUrn: linkedInResponse.id,
-          linkedInPostUrl: linkedInResponse.activity
-            ? `https://www.linkedin.com/feed/update/${linkedInResponse.activity}`
-            : null,
-        },
-      });
+      if (mediaUrls.length > 0) {
+        // Post with image
+        linkedInResponse = await this.createLinkedInPostWithImage(
+          accessToken,
+          memberUrn,
+          content,
+          mediaUrls[0] // LinkedIn only supports one image via UGC
+        );
+      } else {
+        // Text-only post
+        linkedInResponse = await this.createLinkedInPost(
+          accessToken,
+          memberUrn,
+          content
+        );
+      }
 
-      // Update article status
-      await prisma.article.update({
-        where: { id: post.articleId },
-        data: { status: 'POSTED_TO_LINKEDIN' },
-      });
-
-      // Log activity
-      await this.logActivity('POST_PUBLISHED', 'LinkedInPost', postId,
-        `Published to LinkedIn: ${linkedInResponse.id}`);
-
-      result.success = true;
-      result.linkedInUrn = linkedInResponse.id;
-      result.linkedInUrl = linkedInResponse.activity
+      // Build the post URL
+      const postUrl = linkedInResponse.activity
         ? `https://www.linkedin.com/feed/update/${linkedInResponse.activity}`
         : undefined;
+
+      // Update post status
+      const supabase = getSupabaseClient();
+      await supabase
+        .from('social_posts')
+        .update({
+          status: 'PUBLISHED',
+          content_final: content,
+          external_post_id: linkedInResponse.id,
+          published_at: new Date().toISOString(),
+        })
+        .eq('id', postId);
+
+      await logActivity(
+        'POST_PUBLISHED',
+        `Published to LinkedIn: ${linkedInResponse.id}`,
+        'SocialPost',
+        postId,
+        { linkedInUrn: linkedInResponse.id, linkedInUrl: postUrl }
+      );
+
+      result.success = true;
+      result.externalPostId = linkedInResponse.id;
+      result.externalPostUrl = postUrl;
 
       logger.info('Successfully published to LinkedIn', {
         postId,
@@ -287,17 +272,14 @@ export class LinkedInPublisherService {
     } catch (error) {
       result.error = error instanceof Error ? error.message : 'Unknown error';
 
-      // Mark as failed
-      await prisma.linkedInPost.update({
-        where: { id: postId },
-        data: {
-          status: 'FAILED',
-          errorMessage: result.error,
-        },
-      });
+      await this.updatePostStatus(postId, 'FAILED', undefined, result.error);
 
-      await this.logActivity('POST_FAILED', 'LinkedInPost', postId,
-        `Failed to publish: ${result.error}`);
+      await logActivity(
+        'POST_FAILED',
+        `Failed to publish to LinkedIn: ${result.error}`,
+        'SocialPost',
+        postId
+      );
 
       logger.error('Failed to publish to LinkedIn', { postId, error: result.error });
     }
@@ -306,7 +288,7 @@ export class LinkedInPublisherService {
   }
 
   /**
-   * Create a post on LinkedIn using the UGC API
+   * Create a text-only post on LinkedIn
    */
   private async createLinkedInPost(
     accessToken: string,
@@ -349,12 +331,11 @@ export class LinkedInPublisherService {
     } catch (error) {
       const axiosError = error as AxiosError<LinkedInAPIError>;
       const errorMessage = axiosError.response?.data?.message || axiosError.message;
-      const errorCode = axiosError.response?.data?.serviceErrorCode;
 
       logger.error('LinkedIn API error', {
         status: axiosError.response?.status,
         message: errorMessage,
-        serviceErrorCode: errorCode,
+        serviceErrorCode: axiosError.response?.data?.serviceErrorCode,
       });
 
       throw new Error(`LinkedIn API error: ${errorMessage}`);
@@ -362,105 +343,79 @@ export class LinkedInPublisherService {
   }
 
   /**
-   * Approve a post for publishing
+   * Create a post with image on LinkedIn
    */
-  async approvePost(postId: string): Promise<void> {
-    await prisma.linkedInPost.update({
-      where: { id: postId },
-      data: { status: 'APPROVED' },
-    });
-
-    await this.logActivity('POST_APPROVED', 'LinkedInPost', postId, 'Post approved for publishing');
-    logger.info('Post approved', { postId });
-  }
-
-  /**
-   * Reject a post
-   */
-  async rejectPost(postId: string, reason?: string): Promise<void> {
-    await prisma.linkedInPost.update({
-      where: { id: postId },
-      data: {
-        status: 'FAILED',
-        errorMessage: reason || 'Rejected by reviewer',
+  private async createLinkedInPostWithImage(
+    accessToken: string,
+    memberUrn: string,
+    text: string,
+    imageUrl: string
+  ): Promise<{ id: string; activity?: string }> {
+    // For now, we'll use a link share with the image URL
+    // Full image upload requires more complex flow with registerUpload
+    const payload = {
+      author: memberUrn,
+      lifecycleState: 'PUBLISHED',
+      specificContent: {
+        'com.linkedin.ugc.ShareContent': {
+          shareCommentary: {
+            text,
+          },
+          shareMediaCategory: 'ARTICLE',
+          media: [
+            {
+              status: 'READY',
+              originalUrl: imageUrl,
+            },
+          ],
+        },
       },
-    });
-
-    logger.info('Post rejected', { postId, reason });
-  }
-
-  /**
-   * Publish all approved posts (respecting rate limits)
-   */
-  async publishApprovedPosts(): Promise<PublishResult[]> {
-    const rateLimit = await this.canPostToday();
-    if (!rateLimit.canPost) {
-      logger.info('Daily post limit reached, skipping publication');
-      return [];
-    }
-
-    const approvedPosts = await prisma.linkedInPost.findMany({
-      where: {
-        OR: [
-          { status: 'APPROVED' },
-          // Also pick up DRAFT posts in auto mode
-          ...(config.autoPostToLinkedIn && !config.manualReviewMode
-            ? [{ status: 'DRAFT' as LinkedInPostStatus }]
-            : []),
-        ],
+      visibility: {
+        'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC',
       },
-      take: rateLimit.remaining,
-      orderBy: { createdAt: 'asc' },
-    });
+    };
 
-    const results: PublishResult[] = [];
+    try {
+      const response = await axios.post(
+        `${LINKEDIN_API_BASE}/ugcPosts`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'X-Restli-Protocol-Version': '2.0.0',
+          },
+        }
+      );
 
-    for (const post of approvedPosts) {
-      const result = await this.publishPost(post.id);
-      results.push(result);
-
-      // Check rate limit after each post
-      const newLimit = await this.canPostToday();
-      if (!newLimit.canPost) {
-        break;
-      }
+      return {
+        id: response.data.id,
+        activity: response.headers['x-restli-id'],
+      };
+    } catch (error) {
+      // If image post fails, try text-only
+      logger.warn('Image post failed, trying text-only', { error });
+      return this.createLinkedInPost(accessToken, memberUrn, text);
     }
-
-    return results;
   }
 
   /**
    * Test the LinkedIn connection
    */
-  async testConnection(): Promise<{ success: boolean; memberUrn?: string; error?: string }> {
+  async testConnection(): Promise<{ success: boolean; details?: Record<string, unknown>; error?: string }> {
     try {
       const accessToken = await this.getAccessToken();
-      const memberUrn = await this.getMemberUrn(accessToken);
+      const memberUrn = await this.fetchMemberUrn(accessToken);
 
-      return { success: true, memberUrn };
+      return {
+        success: true,
+        details: { memberUrn },
+      };
     } catch (error) {
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
       };
-    }
-  }
-
-  /**
-   * Log activity
-   */
-  private async logActivity(type: string, entityType: string, entityId: string, message: string): Promise<void> {
-    try {
-      await prisma.activityLog.create({
-        data: {
-          type,
-          entityType,
-          entityId,
-          message,
-        },
-      });
-    } catch (error) {
-      logger.error('Failed to log activity', { error, type, message });
     }
   }
 }

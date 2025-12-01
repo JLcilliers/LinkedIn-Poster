@@ -797,45 +797,55 @@ function getStatusBadge(status) {
 
 // Simple router for serverless
 function handleRequest(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname;
-  const method = req.method;
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const path = url.pathname;
+    const method = req.method;
 
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (method === 'OPTIONS') {
-    res.status(200).end();
-    return;
+    if (method === 'OPTIONS') {
+      res.statusCode = 200;
+      res.end();
+      return;
+    }
+
+    // Page routes
+    if (path === '/' || path === '/api') return handleDashboard(req, res);
+    if (path === '/sources') return handleSourcesPage(req, res);
+    if (path === '/articles') return handleArticlesPage(req, res);
+    if (path === '/posts') return handlePostsPage(req, res);
+
+    // Auth routes
+    if (path === '/auth/linkedin') return handleLinkedInAuth(req, res);
+    if (path === '/auth/linkedin/callback') return handleLinkedInCallback(req, res, url);
+
+    // API routes
+    if (path === '/api/status') return handleStatus(req, res);
+    if (path === '/api/sources' && method === 'POST') return handleAddSource(req, res);
+    if (path === '/api/sources' && method === 'GET') return handleGetSources(req, res);
+    if (path.startsWith('/api/sources/') && method === 'DELETE') return handleDeleteSource(req, res, path);
+    if (path.startsWith('/api/sources/') && path.endsWith('/check')) return handleCheckSource(req, res, path);
+    if (path === '/api/sources/check-all') return handleCheckAllSources(req, res);
+    if (path === '/api/articles' && method === 'GET') return handleGetArticles(req, res);
+    if (path === '/api/generate' && method === 'POST') return handleGenerateFromUrl(req, res);
+    if (path.startsWith('/api/articles/') && path.endsWith('/generate')) return handleGenerateFromArticle(req, res, path);
+    if (path.startsWith('/api/posts/') && path.endsWith('/approve')) return handleApprovePost(req, res, path);
+    if (path.startsWith('/api/posts/') && path.endsWith('/publish')) return handlePublishPost(req, res, path);
+    if (path.startsWith('/api/posts/') && method === 'PUT') return handleUpdatePost(req, res, path);
+    if (path.startsWith('/api/posts/') && method === 'DELETE') return handleDeletePost(req, res, path);
+
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Not Found', path }));
+  } catch (error) {
+    console.error('Handler error:', error);
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Internal Server Error', message: error.message }));
   }
-
-  // Page routes
-  if (path === '/' || path === '/api') return handleDashboard(req, res);
-  if (path === '/sources') return handleSourcesPage(req, res);
-  if (path === '/articles') return handleArticlesPage(req, res);
-  if (path === '/posts') return handlePostsPage(req, res);
-
-  // Auth routes
-  if (path === '/auth/linkedin') return handleLinkedInAuth(req, res);
-  if (path === '/auth/linkedin/callback') return handleLinkedInCallback(req, res, url);
-
-  // API routes
-  if (path === '/api/status') return handleStatus(req, res);
-  if (path === '/api/sources' && method === 'POST') return handleAddSource(req, res);
-  if (path === '/api/sources' && method === 'GET') return handleGetSources(req, res);
-  if (path.startsWith('/api/sources/') && method === 'DELETE') return handleDeleteSource(req, res, path);
-  if (path.startsWith('/api/sources/') && path.endsWith('/check')) return handleCheckSource(req, res, path);
-  if (path === '/api/sources/check-all') return handleCheckAllSources(req, res);
-  if (path === '/api/articles' && method === 'GET') return handleGetArticles(req, res);
-  if (path === '/api/generate' && method === 'POST') return handleGenerateFromUrl(req, res);
-  if (path.startsWith('/api/articles/') && path.endsWith('/generate')) return handleGenerateFromArticle(req, res, path);
-  if (path.startsWith('/api/posts/') && path.endsWith('/approve')) return handleApprovePost(req, res, path);
-  if (path.startsWith('/api/posts/') && path.endsWith('/publish')) return handlePublishPost(req, res, path);
-  if (path.startsWith('/api/posts/') && method === 'PUT') return handleUpdatePost(req, res, path);
-  if (path.startsWith('/api/posts/') && method === 'DELETE') return handleDeletePost(req, res, path);
-
-  res.status(404).json({ error: 'Not Found', path });
 }
 
 // Page handlers
@@ -1086,27 +1096,40 @@ function handleGenerateFromUrl(req, res) {
 }
 
 function handleGenerateFromArticle(req, res, path) {
-  const articleId = path.split('/')[3];
-  const article = articles.find(a => a.id === articleId);
+  try {
+    const articleId = path.split('/')[3];
+    console.log('Generating post for article:', articleId);
+    console.log('Available articles:', articles.length);
 
-  if (!article) {
-    return res.status(404).json({ error: 'Article not found' });
-  }
+    const article = articles.find(a => a.id === articleId);
 
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) {
-    // Fallback if no OpenAI key
-    const post = {
-      id: Date.now().toString(),
-      articleId: article.id,
-      articleTitle: article.title,
-      content: `[OpenAI API key not configured. Please add OPENAI_API_KEY to generate AI content.]`,
-      status: 'pending',
-      createdAt: new Date().toISOString()
-    };
-    posts.push(post);
-    return res.status(201).json(post);
-  }
+    if (!article) {
+      console.log('Article not found');
+      res.statusCode = 404;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'Article not found', articleId, availableIds: articles.map(a => a.id) }));
+      return;
+    }
+
+    const openaiKey = (process.env.OPENAI_API_KEY || '').trim();
+    console.log('OpenAI key configured:', !!openaiKey, 'length:', openaiKey.length);
+
+    if (!openaiKey) {
+      // Fallback if no OpenAI key
+      const post = {
+        id: Date.now().toString(),
+        articleId: article.id,
+        articleTitle: article.title,
+        content: `[OpenAI API key not configured. Please add OPENAI_API_KEY to generate AI content.]`,
+        status: 'pending',
+        createdAt: new Date().toISOString()
+      };
+      posts.push(post);
+      res.statusCode = 201;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(post));
+      return;
+    }
 
   // Use OpenAI to generate original LinkedIn post
   const prompt = `You are a LinkedIn thought leader. Based on the following article topic and summary, write an ORIGINAL LinkedIn post that shares YOUR OWN insights and perspective on this topic.
@@ -1174,19 +1197,33 @@ Write the LinkedIn post now:`;
           timestamp: new Date().toISOString()
         });
 
-        res.status(201).json(post);
+        res.statusCode = 201;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(post));
       } catch (e) {
-        res.status(500).json({ error: 'Failed to parse OpenAI response: ' + e.message });
+        console.error('OpenAI response parse error:', e);
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Failed to parse OpenAI response: ' + e.message }));
       }
     });
   });
 
   openaiReq.on('error', (e) => {
-    res.status(500).json({ error: 'OpenAI request failed: ' + e.message });
+    console.error('OpenAI request error:', e);
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'OpenAI request failed: ' + e.message }));
   });
 
   openaiReq.write(requestBody);
   openaiReq.end();
+  } catch (error) {
+    console.error('handleGenerateFromArticle error:', error);
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Generation failed', message: error.message }));
+  }
 }
 
 function handleApprovePost(req, res, path) {
@@ -1199,12 +1236,126 @@ function handleApprovePost(req, res, path) {
 function handlePublishPost(req, res, path) {
   const postId = path.split('/')[3];
   const post = posts.find(p => p.id === postId);
-  if (post) {
-    post.status = 'published';
-    post.publishedAt = new Date().toISOString();
-    // In production, this would call LinkedIn API
+
+  if (!post) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Post not found' }));
+    return;
   }
-  res.status(200).json({ success: true });
+
+  const accessToken = (process.env.LINKEDIN_ACCESS_TOKEN || '').trim();
+  const memberUrn = (process.env.LINKEDIN_MEMBER_URN || '').trim();
+
+  if (!accessToken) {
+    res.statusCode = 400;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'LinkedIn not connected. Please add LINKEDIN_ACCESS_TOKEN to environment variables.' }));
+    return;
+  }
+
+  if (!memberUrn) {
+    res.statusCode = 400;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'LinkedIn member URN not configured. Please add LINKEDIN_MEMBER_URN to environment variables.' }));
+    return;
+  }
+
+  // LinkedIn UGC Post API
+  const postBody = JSON.stringify({
+    author: memberUrn,
+    lifecycleState: 'PUBLISHED',
+    specificContent: {
+      'com.linkedin.ugc.ShareContent': {
+        shareCommentary: {
+          text: post.content
+        },
+        shareMediaCategory: 'NONE'
+      }
+    },
+    visibility: {
+      'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC'
+    }
+  });
+
+  const options = {
+    hostname: 'api.linkedin.com',
+    path: '/v2/ugcPosts',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      'X-Restli-Protocol-Version': '2.0.0',
+      'Content-Length': Buffer.byteLength(postBody)
+    }
+  };
+
+  console.log('Publishing to LinkedIn:', { memberUrn, contentLength: post.content.length });
+
+  const linkedInReq = https.request(options, (linkedInRes) => {
+    let data = '';
+    linkedInRes.on('data', chunk => data += chunk);
+    linkedInRes.on('end', () => {
+      console.log('LinkedIn response status:', linkedInRes.statusCode);
+      console.log('LinkedIn response:', data);
+
+      try {
+        if (linkedInRes.statusCode === 201) {
+          const result = JSON.parse(data);
+          post.status = 'published';
+          post.publishedAt = new Date().toISOString();
+          post.linkedInPostUrn = result.id;
+          // Construct the LinkedIn post URL from the URN
+          const shareId = result.id.replace('urn:li:share:', '');
+          post.linkedInUrl = `https://www.linkedin.com/feed/update/${result.id}/`;
+
+          activityLog.push({
+            id: Date.now().toString(),
+            type: 'POST_PUBLISHED',
+            message: `Published to LinkedIn: ${post.articleTitle?.substring(0, 40)}...`,
+            details: `URN: ${result.id}`,
+            timestamp: new Date().toISOString()
+          });
+
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            success: true,
+            linkedInPostUrn: result.id,
+            linkedInUrl: post.linkedInUrl
+          }));
+        } else {
+          const errorResult = JSON.parse(data);
+          console.error('LinkedIn API error:', errorResult);
+          post.status = 'failed';
+          post.errorMessage = errorResult.message || 'LinkedIn API error';
+
+          res.statusCode = linkedInRes.statusCode;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            error: 'LinkedIn API error',
+            details: errorResult.message || data,
+            status: linkedInRes.statusCode
+          }));
+        }
+      } catch (e) {
+        console.error('LinkedIn response parse error:', e);
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Failed to parse LinkedIn response', details: data }));
+      }
+    });
+  });
+
+  linkedInReq.on('error', (e) => {
+    console.error('LinkedIn request error:', e);
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'LinkedIn request failed', message: e.message }));
+  });
+
+  linkedInReq.write(postBody);
+  linkedInReq.end();
 }
 
 function handleUpdatePost(req, res, path) {
@@ -1256,7 +1407,8 @@ function handleLinkedInCallback(req, res, url) {
 
   if (error) {
     res.setHeader('Content-Type', 'text/html');
-    res.status(400).send(getErrorHTML('OAuth Error', error));
+    res.statusCode = 400;
+    res.end(getErrorHTML('OAuth Error', error));
     return;
   }
 
@@ -1286,36 +1438,109 @@ function handleLinkedInCallback(req, res, url) {
         const tokenResponse = JSON.parse(body);
         if (tokenResponse.error) {
           res.setHeader('Content-Type', 'text/html');
-          res.status(400).send(getErrorHTML('Token Error', tokenResponse.error_description));
+          res.statusCode = 400;
+          res.end(getErrorHTML('Token Error', tokenResponse.error_description));
           return;
         }
-        res.setHeader('Content-Type', 'text/html');
-        res.status(200).send(getSuccessHTML(tokenResponse));
+
+        // Now fetch the user's profile to get the member URN
+        const profileOptions = {
+          hostname: 'api.linkedin.com',
+          path: '/v2/userinfo',
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${tokenResponse.access_token}`
+          }
+        };
+
+        const profileReq = https.request(profileOptions, (profileRes) => {
+          let profileBody = '';
+          profileRes.on('data', chunk => profileBody += chunk);
+          profileRes.on('end', () => {
+            try {
+              const profileData = JSON.parse(profileBody);
+              // The 'sub' field contains the member ID
+              const memberUrn = profileData.sub ? `urn:li:person:${profileData.sub}` : null;
+
+              res.setHeader('Content-Type', 'text/html');
+              res.statusCode = 200;
+              res.end(getSuccessHTML(tokenResponse, memberUrn, profileData));
+            } catch (e) {
+              // Still return the token even if profile fetch fails
+              res.setHeader('Content-Type', 'text/html');
+              res.statusCode = 200;
+              res.end(getSuccessHTML(tokenResponse, null, null));
+            }
+          });
+        });
+
+        profileReq.on('error', (e) => {
+          // Still return the token even if profile fetch fails
+          res.setHeader('Content-Type', 'text/html');
+          res.statusCode = 200;
+          res.end(getSuccessHTML(tokenResponse, null, null));
+        });
+
+        profileReq.end();
       } catch (e) {
-        res.status(500).send(getErrorHTML('Parse Error', 'Failed to parse response'));
+        res.statusCode = 500;
+        res.end(getErrorHTML('Parse Error', 'Failed to parse response'));
       }
     });
   });
 
-  tokenReq.on('error', (e) => res.status(500).send(getErrorHTML('Request Error', e.message)));
+  tokenReq.on('error', (e) => {
+    res.statusCode = 500;
+    res.end(getErrorHTML('Request Error', e.message));
+  });
   tokenReq.write(tokenData);
   tokenReq.end();
 }
 
-function getSuccessHTML(tokenResponse) {
+function getSuccessHTML(tokenResponse, memberUrn, profileData) {
+  const userName = profileData ? profileData.name || 'User' : 'User';
   return `
 <!DOCTYPE html>
 <html><head><title>LinkedIn Connected!</title>${getStyles()}</head>
 <body style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh;">
-  <div class="card" style="max-width: 600px; text-align: center;">
+  <div class="card" style="max-width: 700px; text-align: center;">
     <div style="font-size: 4rem;">✅</div>
     <h1 style="color: #28a745;">LinkedIn Connected!</h1>
-    <p>Copy the token below and add it to Vercel environment variables.</p>
-    <div style="background: #f8f9fa; padding: 16px; border-radius: 8px; word-break: break-all; font-family: monospace; margin: 20px 0;">
-      ${tokenResponse.access_token}
+    ${profileData ? `<p style="font-size: 1.1rem;">Welcome, <strong>${userName}</strong>!</p>` : ''}
+    <p>Copy these values and add them to your Vercel environment variables:</p>
+
+    <div style="text-align: left; margin: 20px 0;">
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: 600; display: block; margin-bottom: 8px;">LINKEDIN_ACCESS_TOKEN:</label>
+        <div style="background: #f8f9fa; padding: 12px; border-radius: 8px; word-break: break-all; font-family: monospace; font-size: 0.85rem; border: 1px solid #dee2e6;">
+          ${tokenResponse.access_token}
+        </div>
+        <button class="btn btn-success btn-sm" style="margin-top: 8px;" onclick="navigator.clipboard.writeText('${tokenResponse.access_token}').then(() => this.textContent = '✓ Copied!')">📋 Copy Token</button>
+      </div>
+
+      ${memberUrn ? `
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: 600; display: block; margin-bottom: 8px;">LINKEDIN_MEMBER_URN:</label>
+        <div style="background: #f8f9fa; padding: 12px; border-radius: 8px; word-break: break-all; font-family: monospace; font-size: 0.85rem; border: 1px solid #dee2e6;">
+          ${memberUrn}
+        </div>
+        <button class="btn btn-success btn-sm" style="margin-top: 8px;" onclick="navigator.clipboard.writeText('${memberUrn}').then(() => this.textContent = '✓ Copied!')">📋 Copy URN</button>
+      </div>
+      ` : `
+      <div class="alert alert-warning" style="text-align: left;">
+        <strong>Note:</strong> Could not retrieve member URN. You may need to get it manually from LinkedIn API.
+      </div>
+      `}
     </div>
-    <button class="btn btn-success" onclick="navigator.clipboard.writeText('${tokenResponse.access_token}').then(() => alert('Copied!'))">📋 Copy Token</button>
-    <a href="/" class="btn btn-secondary" style="margin-left: 12px;">← Dashboard</a>
+
+    <div class="alert alert-info" style="text-align: left;">
+      <strong>Next Steps:</strong><br>
+      1. Go to your Vercel project settings<br>
+      2. Add both environment variables<br>
+      3. Redeploy your project
+    </div>
+
+    <a href="/" class="btn btn-primary" style="margin-top: 16px;">← Back to Dashboard</a>
     <p style="margin-top: 20px; color: #666;">Token expires in ${Math.floor(tokenResponse.expires_in / 86400)} days</p>
   </div>
 </body></html>`;

@@ -1,13 +1,33 @@
 import Parser from 'rss-parser';
-import { prisma } from '../config/database';
+import { getSupabaseClient, BlogSource, Article, logActivity, SourceType } from '../config/supabase';
 import { logger } from '../utils/logger';
-import type { BlogSource, FetchResult, RSSFeedItem } from '../types';
+
+interface RSSFeedItem {
+  title?: string;
+  link?: string;
+  guid?: string;
+  pubDate?: string;
+  isoDate?: string;
+  content?: string;
+  contentSnippet?: string;
+}
+
+export interface FetchResult {
+  success: boolean;
+  articlesFound: number;
+  articlesNew: number;
+  errors: string[];
+}
 
 const parser = new Parser<unknown, RSSFeedItem>({
   timeout: 30000,
   headers: {
-    'User-Agent': 'LinkedIn Blog Reposter/1.0',
+    'User-Agent': 'Social Autoposter/1.0',
     'Accept': 'application/rss+xml, application/xml, text/xml',
+  },
+  // Handle redirects
+  requestOptions: {
+    redirect: 'follow',
   },
 });
 
@@ -16,16 +36,23 @@ export class SourceWatcherService {
    * Check all active sources for new articles
    */
   async checkAllSources(): Promise<FetchResult[]> {
-    const sources = await prisma.blogSource.findMany({
-      where: { active: true },
-    });
+    const supabase = getSupabaseClient();
+    const { data: sources, error } = await supabase
+      .from('blog_sources')
+      .select('*')
+      .eq('active', true);
+
+    if (error || !sources) {
+      logger.error('Failed to fetch active sources', { error });
+      return [];
+    }
 
     logger.info(`Checking ${sources.length} active sources`);
 
     const results: FetchResult[] = [];
     for (const source of sources) {
       try {
-        const result = await this.checkSource(source);
+        const result = await this.checkSource(source as BlogSource);
         results.push(result);
       } catch (error) {
         logger.error(`Error checking source ${source.name}`, { error, sourceId: source.id });
@@ -45,7 +72,7 @@ export class SourceWatcherService {
    * Check a single source for new articles
    */
   async checkSource(source: BlogSource): Promise<FetchResult> {
-    logger.info(`Checking source: ${source.name}`, { sourceId: source.id, feedUrl: source.feedUrl });
+    logger.info(`Checking source: ${source.name}`, { sourceId: source.id, feedUrl: source.feed_url });
 
     const result: FetchResult = {
       success: true,
@@ -56,13 +83,13 @@ export class SourceWatcherService {
 
     try {
       switch (source.type) {
-        case 'RSS':
+        case 'rss':
           await this.fetchRSSFeed(source, result);
           break;
-        case 'SITEMAP':
+        case 'sitemap':
           await this.fetchSitemap(source, result);
           break;
-        case 'CUSTOM_SCRAPER':
+        case 'custom':
           logger.warn(`Custom scraper not implemented for source: ${source.name}`);
           break;
         default:
@@ -70,14 +97,19 @@ export class SourceWatcherService {
       }
 
       // Update last checked timestamp
-      await prisma.blogSource.update({
-        where: { id: source.id },
-        data: { lastCheckedAt: new Date() },
-      });
+      const supabase = getSupabaseClient();
+      await supabase
+        .from('blog_sources')
+        .update({ last_checked_at: new Date().toISOString() })
+        .eq('id', source.id);
 
       // Log activity
-      await this.logActivity('SOURCE_CHECKED', 'BlogSource', source.id,
-        `Checked source "${source.name}": found ${result.articlesFound} articles, ${result.articlesNew} new`);
+      await logActivity(
+        'SOURCE_CHECKED',
+        `Checked source "${source.name}": found ${result.articlesFound} articles, ${result.articlesNew} new`,
+        'BlogSource',
+        source.id
+      );
 
     } catch (error) {
       result.success = false;
@@ -92,13 +124,14 @@ export class SourceWatcherService {
    * Fetch and process RSS feed
    */
   private async fetchRSSFeed(source: BlogSource, result: FetchResult): Promise<void> {
-    const feed = await parser.parseURL(source.feedUrl);
+    const supabase = getSupabaseClient();
+    const feed = await parser.parseURL(source.feed_url);
     const items = feed.items || [];
     result.articlesFound = items.length;
 
     logger.debug(`Fetched ${items.length} items from RSS feed`, { sourceId: source.id });
 
-    let latestPublishedAt: Date | null = null;
+    let latestPublishedAt: string | null = null;
     let latestExternalId: string | null = null;
 
     for (const item of items) {
@@ -108,23 +141,16 @@ export class SourceWatcherService {
         continue;
       }
 
-      const publishedAt = item.isoDate ? new Date(item.isoDate) :
-                         item.pubDate ? new Date(item.pubDate) : null;
-
-      // Skip if older than last seen (if we have a reference)
-      if (source.lastSeenPublishedAt && publishedAt && publishedAt <= source.lastSeenPublishedAt) {
-        continue;
-      }
+      const publishedAt = item.isoDate || item.pubDate || null;
+      const publishedAtDate = publishedAt ? new Date(publishedAt) : null;
 
       // Check if article already exists
-      const existing = await prisma.article.findUnique({
-        where: {
-          sourceId_externalId: {
-            sourceId: source.id,
-            externalId,
-          },
-        },
-      });
+      const { data: existing } = await supabase
+        .from('articles')
+        .select('id')
+        .eq('source_id', source.id)
+        .eq('external_id', externalId)
+        .single();
 
       if (existing) {
         continue;
@@ -132,17 +158,26 @@ export class SourceWatcherService {
 
       // Create new article
       try {
-        await prisma.article.create({
-          data: {
-            sourceId: source.id,
-            externalId,
+        const { error: insertError } = await supabase
+          .from('articles')
+          .insert({
+            source_id: source.id,
+            external_id: externalId,
             url: item.link || '',
             title: item.title || 'Untitled',
-            rawSummary: item.contentSnippet || item.content || null,
-            publishedAt,
+            raw_summary: item.contentSnippet || item.content || null,
+            published_at: publishedAtDate?.toISOString() || null,
             status: 'NEW',
-          },
-        });
+          });
+
+        if (insertError) {
+          // Handle unique constraint violation (race condition)
+          if (insertError.code === '23505') {
+            logger.debug('Article already exists (race condition)', { externalId });
+            continue;
+          }
+          throw insertError;
+        }
 
         result.articlesNew++;
         logger.info(`New article discovered: ${item.title}`, {
@@ -151,33 +186,32 @@ export class SourceWatcherService {
         });
 
         // Log activity
-        await this.logActivity('ARTICLE_DISCOVERED', 'Article', externalId,
-          `New article: "${item.title}" from ${source.name}`);
+        await logActivity(
+          'ARTICLE_DISCOVERED',
+          `New article: "${item.title}" from ${source.name}`,
+          'Article',
+          externalId
+        );
 
         // Track latest for updating source
-        if (publishedAt && (!latestPublishedAt || publishedAt > latestPublishedAt)) {
-          latestPublishedAt = publishedAt;
+        if (publishedAtDate && (!latestPublishedAt || publishedAtDate > new Date(latestPublishedAt))) {
+          latestPublishedAt = publishedAtDate.toISOString();
           latestExternalId = externalId;
         }
       } catch (error) {
-        // Handle unique constraint violation (race condition)
-        if (error instanceof Error && error.message.includes('Unique constraint')) {
-          logger.debug('Article already exists (race condition)', { externalId });
-        } else {
-          throw error;
-        }
+        logger.error('Failed to create article', { error, externalId });
+        throw error;
       }
     }
 
     // Update source with latest seen article
-    if (latestPublishedAt || latestExternalId) {
-      await prisma.blogSource.update({
-        where: { id: source.id },
-        data: {
-          lastSeenPublishedAt: latestPublishedAt || undefined,
-          lastSeenExternalId: latestExternalId || undefined,
-        },
-      });
+    if (latestExternalId) {
+      await supabase
+        .from('blog_sources')
+        .update({
+          last_seen_external_id: latestExternalId,
+        })
+        .eq('id', source.id);
     }
   }
 
@@ -185,10 +219,10 @@ export class SourceWatcherService {
    * Fetch and process sitemap
    */
   private async fetchSitemap(source: BlogSource, result: FetchResult): Promise<void> {
-    // Basic sitemap support - can be extended
+    const supabase = getSupabaseClient();
     logger.warn('Sitemap parsing is basic - consider implementing full support', { sourceId: source.id });
 
-    const response = await fetch(source.feedUrl);
+    const response = await fetch(source.feed_url);
     const text = await response.text();
 
     // Simple regex to extract URLs from sitemap
@@ -209,99 +243,169 @@ export class SourceWatcherService {
       const externalId = url;
 
       // Check if article already exists
-      const existing = await prisma.article.findUnique({
-        where: {
-          sourceId_externalId: {
-            sourceId: source.id,
-            externalId,
-          },
-        },
-      });
+      const { data: existing } = await supabase
+        .from('articles')
+        .select('id')
+        .eq('source_id', source.id)
+        .eq('external_id', externalId)
+        .single();
 
       if (existing) {
         continue;
       }
 
       // Create new article with minimal info (will be enriched by ArticleFetcher)
-      await prisma.article.create({
-        data: {
-          sourceId: source.id,
-          externalId,
+      const { error: insertError } = await supabase
+        .from('articles')
+        .insert({
+          source_id: source.id,
+          external_id: externalId,
           url,
           title: 'Pending fetch',
           status: 'NEW',
-        },
-      });
+        });
 
-      result.articlesNew++;
-    }
-  }
-
-  /**
-   * Log an activity to the database
-   */
-  private async logActivity(type: string, entityType: string, entityId: string, message: string): Promise<void> {
-    try {
-      await prisma.activityLog.create({
-        data: {
-          type,
-          entityType,
-          entityId,
-          message,
-        },
-      });
-    } catch (error) {
-      logger.error('Failed to log activity', { error, type, message });
+      if (!insertError) {
+        result.articlesNew++;
+      }
     }
   }
 
   /**
    * Add a new blog source
    */
-  async addSource(name: string, feedUrl: string, type: 'RSS' | 'SITEMAP' | 'CUSTOM_SCRAPER' = 'RSS'): Promise<BlogSource> {
-    const source = await prisma.blogSource.create({
-      data: {
+  async addSource(name: string, feedUrl: string, type: SourceType = 'rss'): Promise<BlogSource | null> {
+    const supabase = getSupabaseClient();
+
+    const { data: source, error } = await supabase
+      .from('blog_sources')
+      .insert({
         name,
-        feedUrl,
+        feed_url: feedUrl,
         type,
         active: true,
-      },
-    });
+      })
+      .select()
+      .single();
 
-    await this.logActivity('SOURCE_ADDED', 'BlogSource', source.id, `Added new source: ${name}`);
+    if (error || !source) {
+      logger.error('Failed to add source', { error, name, feedUrl });
+      return null;
+    }
+
+    await logActivity('SOURCE_ADDED', `Added new source: ${name}`, 'BlogSource', source.id);
     logger.info(`Added new blog source: ${name}`, { sourceId: source.id, feedUrl });
 
-    return source;
+    return source as BlogSource;
   }
 
   /**
    * List all sources
    */
   async listSources(activeOnly: boolean = false): Promise<BlogSource[]> {
-    return prisma.blogSource.findMany({
-      where: activeOnly ? { active: true } : undefined,
-      orderBy: { createdAt: 'desc' },
-    });
+    const supabase = getSupabaseClient();
+
+    let query = supabase
+      .from('blog_sources')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (activeOnly) {
+      query = query.eq('active', true);
+    }
+
+    const { data, error } = await query;
+
+    if (error || !data) {
+      logger.error('Failed to list sources', { error });
+      return [];
+    }
+
+    return data as BlogSource[];
+  }
+
+  /**
+   * Get a source by ID
+   */
+  async getSource(sourceId: string): Promise<BlogSource | null> {
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase
+      .from('blog_sources')
+      .select('*')
+      .eq('id', sourceId)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return data as BlogSource;
   }
 
   /**
    * Toggle source active status
    */
-  async toggleSource(sourceId: string, active: boolean): Promise<BlogSource> {
-    return prisma.blogSource.update({
-      where: { id: sourceId },
-      data: { active },
-    });
+  async toggleSource(sourceId: string, active: boolean): Promise<BlogSource | null> {
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase
+      .from('blog_sources')
+      .update({ active })
+      .eq('id', sourceId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      logger.error('Failed to toggle source', { error, sourceId });
+      return null;
+    }
+
+    return data as BlogSource;
   }
 
   /**
-   * Delete a source and its articles
+   * Delete a source and its articles (cascade delete handled by DB)
    */
-  async deleteSource(sourceId: string): Promise<void> {
-    await prisma.blogSource.delete({
-      where: { id: sourceId },
-    });
+  async deleteSource(sourceId: string): Promise<boolean> {
+    const supabase = getSupabaseClient();
+
+    const { error } = await supabase
+      .from('blog_sources')
+      .delete()
+      .eq('id', sourceId);
+
+    if (error) {
+      logger.error('Failed to delete source', { error, sourceId });
+      return false;
+    }
+
     logger.info(`Deleted blog source`, { sourceId });
+    return true;
+  }
+
+  /**
+   * Update a source
+   */
+  async updateSource(
+    sourceId: string,
+    updates: Partial<Pick<BlogSource, 'name' | 'feed_url' | 'type' | 'active'>>
+  ): Promise<BlogSource | null> {
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase
+      .from('blog_sources')
+      .update(updates)
+      .eq('id', sourceId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      logger.error('Failed to update source', { error, sourceId });
+      return null;
+    }
+
+    return data as BlogSource;
   }
 }
 

@@ -1,8 +1,22 @@
-import { prisma } from '../config/database';
+import { getSupabaseClient, Article, CriteriaConfig, ArticleStatus, Platform, logActivity } from '../config/supabase';
 import { logger } from '../utils/logger';
-import type { Article, CriteriaConfig, FilterResult, ParsedCriteria } from '../types';
 
 const BATCH_SIZE = 20;
+
+export interface FilterResult {
+  articleId: string;
+  isRelevant: boolean;
+  matchedKeywords: string[];
+  excludedKeywords: string[];
+}
+
+export interface ParsedCriteria {
+  includeKeywords: string[];
+  excludeKeywords: string[];
+  targetAudienceDescription: string;
+  defaultHashtags: string[];
+  maxPostsPerDayPerPlatform: Record<Platform, number>;
+}
 
 export class RelevanceFilterService {
   /**
@@ -15,14 +29,21 @@ export class RelevanceFilterService {
       return { processed: 0, relevant: 0, rejected: 0 };
     }
 
-    const articles = await prisma.article.findMany({
-      where: {
-        status: 'CONTENT_FETCHED',
-        rawContent: { not: null },
-      },
-      take: BATCH_SIZE,
-      orderBy: { createdAt: 'asc' },
-    });
+    const supabase = getSupabaseClient();
+
+    // Find articles with content that need filtering
+    const { data: articles, error } = await supabase
+      .from('articles')
+      .select('*')
+      .eq('status', 'NEW')
+      .not('raw_content', 'is', null)
+      .order('created_at', { ascending: true })
+      .limit(BATCH_SIZE);
+
+    if (error || !articles) {
+      logger.error('Failed to fetch pending articles for filtering', { error });
+      return { processed: 0, relevant: 0, rejected: 0 };
+    }
 
     logger.info(`Found ${articles.length} articles to filter`);
 
@@ -30,7 +51,7 @@ export class RelevanceFilterService {
 
     for (const article of articles) {
       results.processed++;
-      const filterResult = await this.filterArticle(article, criteria);
+      const filterResult = await this.filterArticle(article as Article, criteria);
 
       if (filterResult.isRelevant) {
         results.relevant++;
@@ -54,6 +75,8 @@ export class RelevanceFilterService {
       criteria = criteriaConfig;
     }
 
+    const supabase = getSupabaseClient();
+
     const result: FilterResult = {
       articleId: article.id,
       isRelevant: false,
@@ -62,7 +85,7 @@ export class RelevanceFilterService {
     };
 
     // Combine title and content for searching
-    const searchText = `${article.title} ${article.rawContent || ''}`.toLowerCase();
+    const searchText = `${article.title} ${article.raw_content || ''}`.toLowerCase();
 
     // Check include keywords (at least one must match)
     for (const keyword of criteria.includeKeywords) {
@@ -88,13 +111,18 @@ export class RelevanceFilterService {
 
     // Update article status
     if (result.isRelevant) {
-      await prisma.article.update({
-        where: { id: article.id },
-        data: { status: 'READY_FOR_POST' },
-      });
+      await supabase
+        .from('articles')
+        .update({ status: 'READY_FOR_POST' as ArticleStatus })
+        .eq('id', article.id);
 
-      await this.logActivity('ARTICLE_FILTERED', 'Article', article.id,
-        `Article marked as relevant: "${article.title}" (matched: ${result.matchedKeywords.join(', ')})`);
+      await logActivity(
+        'ARTICLE_FILTERED',
+        `Article marked as relevant: "${article.title}" (matched: ${result.matchedKeywords.join(', ')})`,
+        'Article',
+        article.id,
+        { matchedKeywords: result.matchedKeywords }
+      );
 
       logger.info(`Article marked as relevant: ${article.title}`, {
         articleId: article.id,
@@ -105,13 +133,18 @@ export class RelevanceFilterService {
         ? `Excluded keywords found: ${result.excludedKeywords.join(', ')}`
         : 'No matching include keywords';
 
-      await prisma.article.update({
-        where: { id: article.id },
-        data: { status: 'REJECTED_NOT_RELEVANT' },
-      });
+      await supabase
+        .from('articles')
+        .update({ status: 'REJECTED_NOT_RELEVANT' as ArticleStatus })
+        .eq('id', article.id);
 
-      await this.logActivity('ARTICLE_REJECTED', 'Article', article.id,
-        `Article rejected: "${article.title}" - ${reason}`);
+      await logActivity(
+        'ARTICLE_REJECTED',
+        `Article rejected: "${article.title}" - ${reason}`,
+        'Article',
+        article.id,
+        { reason, excludedKeywords: result.excludedKeywords }
+      );
 
       logger.info(`Article rejected as not relevant: ${article.title}`, {
         articleId: article.id,
@@ -126,16 +159,21 @@ export class RelevanceFilterService {
    * Get the active criteria configuration
    */
   async getActiveCriteria(): Promise<ParsedCriteria | null> {
-    const config = await prisma.criteriaConfig.findFirst({
-      where: { active: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const supabase = getSupabaseClient();
 
-    if (!config) {
+    const { data: config, error } = await supabase
+      .from('criteria_configs')
+      .select('*')
+      .eq('active', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error || !config) {
       return null;
     }
 
-    return this.parseCriteriaConfig(config);
+    return this.parseCriteriaConfig(config as CriteriaConfig);
   }
 
   /**
@@ -143,25 +181,17 @@ export class RelevanceFilterService {
    */
   parseCriteriaConfig(config: CriteriaConfig): ParsedCriteria {
     return {
-      includeKeywords: this.parseJsonArray(config.includeKeywords),
-      excludeKeywords: this.parseJsonArray(config.excludeKeywords),
-      targetAudienceDescription: config.targetAudienceDescription,
-      defaultHashtags: this.parseJsonArray(config.defaultHashtags),
-      maxPostsPerDay: config.maxPostsPerDay,
+      includeKeywords: config.include_keywords || [],
+      excludeKeywords: config.exclude_keywords || [],
+      targetAudienceDescription: config.target_audience_description || '',
+      defaultHashtags: config.default_hashtags || [],
+      maxPostsPerDayPerPlatform: config.max_posts_per_day_per_platform || {
+        linkedin: 3,
+        facebook: 3,
+        instagram: 3,
+        x: 5,
+      },
     };
-  }
-
-  /**
-   * Parse JSON array string to array
-   */
-  private parseJsonArray(value: string): string[] {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      // If not valid JSON, try comma-separated
-      return value.split(',').map(s => s.trim()).filter(Boolean);
-    }
   }
 
   /**
@@ -173,26 +203,40 @@ export class RelevanceFilterService {
     excludeKeywords: string[];
     targetAudienceDescription: string;
     defaultHashtags: string[];
-    maxPostsPerDay: number;
-  }>): Promise<CriteriaConfig> {
+    maxPostsPerDayPerPlatform: Record<Platform, number>;
+  }>): Promise<CriteriaConfig | null> {
+    const supabase = getSupabaseClient();
+
     // Deactivate existing configs
-    await prisma.criteriaConfig.updateMany({
-      where: { active: true },
-      data: { active: false },
-    });
+    await supabase
+      .from('criteria_configs')
+      .update({ active: false })
+      .eq('active', true);
 
     // Create new config
-    const config = await prisma.criteriaConfig.create({
-      data: {
+    const { data: config, error } = await supabase
+      .from('criteria_configs')
+      .insert({
         name: criteria.name || 'default',
-        includeKeywords: JSON.stringify(criteria.includeKeywords || []),
-        excludeKeywords: JSON.stringify(criteria.excludeKeywords || []),
-        targetAudienceDescription: criteria.targetAudienceDescription || '',
-        defaultHashtags: JSON.stringify(criteria.defaultHashtags || []),
-        maxPostsPerDay: criteria.maxPostsPerDay || 3,
+        include_keywords: criteria.includeKeywords || [],
+        exclude_keywords: criteria.excludeKeywords || [],
+        target_audience_description: criteria.targetAudienceDescription || '',
+        default_hashtags: criteria.defaultHashtags || [],
+        max_posts_per_day_per_platform: criteria.maxPostsPerDayPerPlatform || {
+          linkedin: 3,
+          facebook: 3,
+          instagram: 3,
+          x: 5,
+        },
         active: true,
-      },
-    });
+      })
+      .select()
+      .single();
+
+    if (error || !config) {
+      logger.error('Failed to create criteria config', { error });
+      return null;
+    }
 
     logger.info('Updated criteria config', {
       configId: config.id,
@@ -200,51 +244,119 @@ export class RelevanceFilterService {
       excludeKeywords: criteria.excludeKeywords,
     });
 
-    return config;
+    return config as CriteriaConfig;
   }
 
   /**
    * Get current criteria config
    */
   async getCurrentCriteria(): Promise<CriteriaConfig | null> {
-    return prisma.criteriaConfig.findFirst({
-      where: { active: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase
+      .from('criteria_configs')
+      .select('*')
+      .eq('active', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return data as CriteriaConfig;
   }
 
   /**
    * Re-filter articles that were previously rejected
    */
   async refilterRejected(): Promise<number> {
-    const rejected = await prisma.article.updateMany({
-      where: { status: 'REJECTED_NOT_RELEVANT' },
-      data: { status: 'CONTENT_FETCHED' },
-    });
+    const supabase = getSupabaseClient();
 
-    if (rejected.count > 0) {
-      logger.info(`Reset ${rejected.count} rejected articles for re-filtering`);
+    // Get rejected articles
+    const { data: rejected } = await supabase
+      .from('articles')
+      .select('id')
+      .eq('status', 'REJECTED_NOT_RELEVANT');
+
+    if (!rejected || rejected.length === 0) {
+      return 0;
     }
 
-    return rejected.count;
+    // Update their status back to NEW
+    const { error } = await supabase
+      .from('articles')
+      .update({ status: 'NEW' as ArticleStatus })
+      .eq('status', 'REJECTED_NOT_RELEVANT');
+
+    if (error) {
+      logger.error('Failed to reset rejected articles', { error });
+      return 0;
+    }
+
+    logger.info(`Reset ${rejected.length} rejected articles for re-filtering`);
+    return rejected.length;
   }
 
   /**
-   * Log activity
+   * Update existing criteria config
    */
-  private async logActivity(type: string, entityType: string, entityId: string, message: string): Promise<void> {
-    try {
-      await prisma.activityLog.create({
-        data: {
-          type,
-          entityType,
-          entityId,
-          message,
-        },
-      });
-    } catch (error) {
-      logger.error('Failed to log activity', { error, type, message });
+  async updateCriteria(
+    configId: string,
+    updates: Partial<{
+      name: string;
+      includeKeywords: string[];
+      excludeKeywords: string[];
+      targetAudienceDescription: string;
+      defaultHashtags: string[];
+      maxPostsPerDayPerPlatform: Record<Platform, number>;
+      active: boolean;
+    }>
+  ): Promise<CriteriaConfig | null> {
+    const supabase = getSupabaseClient();
+
+    const updateData: Record<string, unknown> = {};
+    if (updates.name !== undefined) updateData.name = updates.name;
+    if (updates.includeKeywords !== undefined) updateData.include_keywords = updates.includeKeywords;
+    if (updates.excludeKeywords !== undefined) updateData.exclude_keywords = updates.excludeKeywords;
+    if (updates.targetAudienceDescription !== undefined) updateData.target_audience_description = updates.targetAudienceDescription;
+    if (updates.defaultHashtags !== undefined) updateData.default_hashtags = updates.defaultHashtags;
+    if (updates.maxPostsPerDayPerPlatform !== undefined) updateData.max_posts_per_day_per_platform = updates.maxPostsPerDayPerPlatform;
+    if (updates.active !== undefined) updateData.active = updates.active;
+
+    const { data, error } = await supabase
+      .from('criteria_configs')
+      .update(updateData)
+      .eq('id', configId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      logger.error('Failed to update criteria config', { error, configId });
+      return null;
     }
+
+    return data as CriteriaConfig;
+  }
+
+  /**
+   * List all criteria configs
+   */
+  async listCriteriaConfigs(): Promise<CriteriaConfig[]> {
+    const supabase = getSupabaseClient();
+
+    const { data, error } = await supabase
+      .from('criteria_configs')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error || !data) {
+      logger.error('Failed to list criteria configs', { error });
+      return [];
+    }
+
+    return data as CriteriaConfig[];
   }
 }
 

@@ -48,3 +48,5 @@ coverage/
 # Logo files (generated)
 app-logo.png
 create-logo.ps1
+
+.vercel

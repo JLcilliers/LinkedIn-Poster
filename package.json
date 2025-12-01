@@ -28,17 +28,18 @@
   "type": "commonjs",
   "dependencies": {
     "@prisma/client": "^6.19.0",
+    "@supabase/supabase-js": "^2.86.0",
     "@types/cheerio": "^0.22.35",
     "@types/express": "^5.0.5",
     "@types/node": "^24.10.1",
     "@types/node-cron": "^3.0.11",
-    "@types/uuid": "^10.0.0",
     "axios": "^1.13.2",
     "cheerio": "^1.1.2",
     "commander": "^14.0.2",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "node-cron": "^4.2.1",
+    "oauth-1.0a": "^2.2.6",
     "openai": "^6.9.1",
     "playwright": "^1.57.0",
     "prisma": "^6.19.0",
@@ -51,5 +52,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/uuid": "^10.0.0"
   }
 }

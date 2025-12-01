@@ -7,6 +7,7 @@ interface ExtractedContent {
   content: string;
   author?: string;
   publishedDate?: string;
+  rawHtml?: string;
 }
 
 export async function extractArticleContent(url: string): Promise<ExtractedContent> {
@@ -153,6 +154,7 @@ export async function extractArticleContent(url: string): Promise<ExtractedConte
       content,
       author,
       publishedDate,
+      rawHtml: response.data as string,
     };
   } catch (error) {
     logger.error('Failed to extract article content', { url, error });
