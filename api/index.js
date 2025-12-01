@@ -320,7 +320,7 @@ function getDashboardHTML(config) {
       <div class="empty-state">
         <div class="icon">📰</div>
         <h3>No Blog Sources Yet</h3>
-        <p>Add your first RSS feed to start discovering articles automatically.</p>
+        <p>Add your first website to start discovering articles automatically.</p>
         <a href="/sources" class="btn btn-primary" style="margin-top: 16px;">Add Blog Source</a>
       </div>
     </div>
@@ -387,7 +387,7 @@ function getSourcesHTML() {
       <div class="card-header">
         <div>
           <h1>Blog Sources</h1>
-          <p class="subtitle">RSS feeds to monitor for new content</p>
+          <p class="subtitle">Websites to monitor for new content</p>
         </div>
         <button class="btn btn-primary" onclick="showAddModal()">+ Add Source</button>
       </div>
@@ -396,7 +396,7 @@ function getSourcesHTML() {
         <div class="empty-state">
           <div class="icon">📡</div>
           <h3>No Sources Added</h3>
-          <p>Add RSS feeds from blogs you want to share on LinkedIn.</p>
+          <p>Add websites to monitor for new articles to share on LinkedIn.</p>
           <button class="btn btn-primary" style="margin-top: 16px;" onclick="showAddModal()">Add Your First Source</button>
         </div>
       ` : `
@@ -415,7 +415,7 @@ function getSourcesHTML() {
               <tr>
                 <td>
                   <strong>${source.name}</strong>
-                  <div style="font-size:0.8rem;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${source.feedUrl}</div>
+                  <div style="font-size:0.8rem;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${source.homeUrl}</div>
                 </td>
                 <td>
                   ${source.includeKeywords && source.includeKeywords.length > 0 ?
@@ -441,14 +441,14 @@ function getSourcesHTML() {
     </div>
 
     <div class="card">
-      <h2>💡 Popular RSS Feeds</h2>
-      <p style="margin: 12px 0 16px; color: #666;">Quick-add popular tech blogs:</p>
+      <h2>💡 Popular Tech Blogs</h2>
+      <p style="margin: 12px 0 16px; color: #666;">Quick-add popular tech blogs (feeds will be auto-discovered):</p>
       <div style="display: flex; flex-wrap: wrap; gap: 8px;">
-        <button class="btn btn-secondary btn-sm" onclick="quickAdd('TechCrunch', 'https://techcrunch.com/feed/')">TechCrunch</button>
-        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Hacker News', 'https://news.ycombinator.com/rss')">Hacker News</button>
-        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Dev.to', 'https://dev.to/feed')">Dev.to</button>
-        <button class="btn btn-secondary btn-sm" onclick="quickAdd('CSS-Tricks', 'https://css-tricks.com/feed/')">CSS-Tricks</button>
-        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Smashing Magazine', 'https://www.smashingmagazine.com/feed/')">Smashing Magazine</button>
+        <button class="btn btn-secondary btn-sm" onclick="quickAdd('TechCrunch', 'https://techcrunch.com')">TechCrunch</button>
+        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Hacker News', 'https://news.ycombinator.com')">Hacker News</button>
+        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Dev.to', 'https://dev.to')">Dev.to</button>
+        <button class="btn btn-secondary btn-sm" onclick="quickAdd('CSS-Tricks', 'https://css-tricks.com')">CSS-Tricks</button>
+        <button class="btn btn-secondary btn-sm" onclick="quickAdd('Smashing Magazine', 'https://www.smashingmagazine.com')">Smashing Magazine</button>
       </div>
     </div>
   </div>
@@ -466,8 +466,9 @@ function getSourcesHTML() {
           <input type="text" id="name" name="name" class="form-control" placeholder="My Company Blog" required>
         </div>
         <div class="form-group">
-          <label for="feedUrl">RSS Feed URL</label>
-          <input type="url" id="feedUrl" name="feedUrl" class="form-control" placeholder="https://example.com/feed.xml" required>
+          <label for="homeUrl">Website Homepage URL</label>
+          <input type="url" id="homeUrl" name="homeUrl" class="form-control" placeholder="https://example.com" required>
+          <small style="color:#666;margin-top:4px;display:block;">Just enter the homepage URL - feeds and sitemaps will be discovered automatically.</small>
         </div>
         <div class="form-group">
           <label for="includeKeywords">Include Keywords (comma-separated)</label>
@@ -494,7 +495,7 @@ function getSourcesHTML() {
     function hideAddModal() { document.getElementById('addModal').classList.remove('active'); }
     function quickAdd(name, url) {
       document.getElementById('name').value = name;
-      document.getElementById('feedUrl').value = url;
+      document.getElementById('homeUrl').value = url;
       showAddModal();
     }
     function deleteSource(id) {
@@ -513,7 +514,7 @@ function getSourcesHTML() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: data.get('name'),
-          feedUrl: data.get('feedUrl'),
+          homeUrl: data.get('homeUrl'),
           includeKeywords: data.get('includeKeywords'),
           excludeKeywords: data.get('excludeKeywords')
         })
@@ -891,11 +892,23 @@ function handleAddSource(req, res) {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     try {
-      const { name, feedUrl, includeKeywords, excludeKeywords } = JSON.parse(body);
+      const { name, homeUrl, includeKeywords, excludeKeywords } = JSON.parse(body);
+
+      // Normalize URL (remove trailing slash, ensure http/https)
+      let normalizedUrl = homeUrl.trim();
+      if (!normalizedUrl.startsWith('http://') && !normalizedUrl.startsWith('https://')) {
+        normalizedUrl = 'https://' + normalizedUrl;
+      }
+      if (normalizedUrl.endsWith('/')) {
+        normalizedUrl = normalizedUrl.slice(0, -1);
+      }
+
       const source = {
         id: Date.now().toString(),
         name,
-        feedUrl,
+        homeUrl: normalizedUrl,
+        discoveredFeedUrl: null, // Will be populated by discovery process
+        type: 'homepage', // Default type, will be updated after discovery
         includeKeywords: includeKeywords ? includeKeywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k) : [],
         excludeKeywords: excludeKeywords ? excludeKeywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k) : [],
         active: true,
@@ -909,7 +922,7 @@ function handleAddSource(req, res) {
         id: Date.now().toString(),
         type: 'SOURCE_ADDED',
         message: `Added source: ${name}`,
-        details: `Keywords: ${source.includeKeywords.length > 0 ? source.includeKeywords.join(', ') : 'All topics'}`,
+        details: `URL: ${normalizedUrl} | Keywords: ${source.includeKeywords.length > 0 ? source.includeKeywords.join(', ') : 'All topics'}`,
         timestamp: new Date().toISOString()
       });
       res.status(201).json(source);
@@ -948,8 +961,8 @@ function handleCheckSource(req, res, path) {
         return reject(new Error('Too many redirects'));
       }
 
-      const feedUrl = new URL(url);
-      const protocol = feedUrl.protocol === 'https:' ? https : require('http');
+      const parsedUrl = new URL(url);
+      const protocol = parsedUrl.protocol === 'https:' ? https : require('http');
 
       const feedReq = protocol.get(url, {
         headers: { 'User-Agent': 'LinkedIn-Blog-Reposter/1.0' }
@@ -973,9 +986,51 @@ function handleCheckSource(req, res, path) {
     });
   }
 
+  // Try to discover feed if not already discovered
+  async function discoverFeed(baseUrl) {
+    const commonFeedPaths = ['/feed', '/feed/', '/rss', '/rss/', '/feed.xml', '/rss.xml', '/atom.xml'];
+    for (const feedPath of commonFeedPaths) {
+      try {
+        const feedUrl = baseUrl + feedPath;
+        const data = await fetchWithRedirects(feedUrl);
+        if (data.includes('<rss') || data.includes('<feed') || data.includes('<channel')) {
+          source.discoveredFeedUrl = feedUrl;
+          source.type = 'feed';
+          return feedUrl;
+        }
+      } catch {
+        // Continue to next path
+      }
+    }
+    return null;
+  }
+
+  // Determine which URL to fetch - prefer discovered feed, fall back to discovery
+  async function getFeedUrl() {
+    if (source.discoveredFeedUrl) {
+      return source.discoveredFeedUrl;
+    }
+    // Try to discover feed from homepage
+    const discoveredFeed = await discoverFeed(source.homeUrl);
+    if (discoveredFeed) {
+      return discoveredFeed;
+    }
+    return null;
+  }
+
   // Fetch and process the RSS feed
-  fetchWithRedirects(source.feedUrl)
+  getFeedUrl()
+    .then(feedUrl => {
+      if (!feedUrl) {
+        return res.status(400).json({
+          error: 'No RSS feed found',
+          message: `Could not find an RSS feed for ${source.homeUrl}. The site may not have a public feed.`
+        });
+      }
+      return fetchWithRedirects(feedUrl);
+    })
     .then(data => {
+      if (!data) return; // Already sent error response
       // Simple RSS parsing (extract items)
       const itemMatches = data.match(/<item[^>]*>[\s\S]*?<\/item>/gi) || [];
       let found = 0;
